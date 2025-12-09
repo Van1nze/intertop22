@@ -1,69 +1,539 @@
+import logging
 import os
-from typing import Optional, List, Dict, Any
+import re
+from typing import Dict, List, Optional, Any
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from openai import OpenAI
 
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-AI_WEBHOOK_SECRET = os.getenv("AI_WEBHOOK_SECRET")  # optional simple auth
+# Можно выставить gpt-4o-mini для экономии
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+AI_WEBHOOK_SECRET = os.getenv("AI_WEBHOOK_SECRET")  # опциональный секрет для SendPulse
 
-# TODO: replace with your own brand/system prompt
-SYSTEM_PROMPT = (
-    "Ты — бренд‑ассистент сети магазинов INTERTOP в Казахстане. "
-    "Отвечай дружелюбно и по делу. Если вопрос не про INTERTOP, мягко верни в тему. "
-    "Языки: русский/казахский/английский — отвечай на языке клиента."
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
 )
 
-OPENAI_URL = "https://api.openai.com/v1/responses"
+# ============================================================
+# ЗАГРУЗКА ЛОКАЛЬНЫХ ФАЙЛОВ (КАК В Intertop.py)
+# ============================================================
+
+
+def load(filename: str) -> str:
+    """Безопасное чтение текстового файла в UTF-8."""
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logging.warning("Не удалось прочитать %s: %s", filename, e)
+        return ""
+
+
+ADDR = load("Адреса магазина.txt")
+BONUS = load("Бонусы.txt")
+VAC = load("Вакансия.txt")
+RET = load("Возврат товара.txt")
+WAR = load("Гарантия.txt")
+DEL = load("Доставка.txt")
+OFR = load("Оферта.txt")
+PRT = load("Партнеры.txt")
+CERT = load("Электронный подарочный сертификат.txt")
+LAW = load("Адвокат.txt")
+
+INFO_URLS = {
+    "delivery": "https://intertop.kz/ru-kz/info/payment/",
+    "return": "https://intertop.kz/ru-kz/info/return/",
+    "bonus": "https://intertop.kz/ru-kz/info/intertop-plus/",
+    "warranty": "https://intertop.kz/ru-kz/info/garantii/",
+    "offer": "https://intertop.kz/ru-kz/info/offerta/",
+    "work": "https://intertop.kz/ru-kz/info/work/",
+    "about": "https://intertop.kz/ru-kz/info/about/",
+    "buycert": "https://intertop.kz/ru-kz/info/buycertificate/",
+    "brands": "https://intertop.kz/ru-kz/brands/",
+}
+
+# ============================================================
+# ПАМЯТЬ ПО КОНТАКТУ (ПО contact_id / user_id)
+# ============================================================
+
+# Режим по пользователю: "faq" | "style" | "lawyer"
+state: Dict[str, str] = {}
+
+# История диалога для GPT
+dialog_history: Dict[str, List[Dict[str, str]]] = {}
+
+# Профиль клиента: пол, размер, бренды, бюджет
+user_profile: Dict[str, Dict[str, Any]] = {}
+
+# Зафиксированный язык ответов: "ru" | "en" | "kk"
+user_lang: Dict[str, str] = {}
+
+# Кэш страниц сайта
+_page_cache: Dict[str, str] = {}
+
+# ============================================================
+# ФИЛЬТР ОПАСНЫХ / НЕПРОФИЛЬНЫХ ТЕМ
+# ============================================================
+
+
+def is_hard_offtopic(text: str) -> bool:
+    t = text.lower()
+    bad_words = [
+        "лекарств",
+        "таблетк",
+        "симптом",
+        "диагноз",
+        "температур",
+        "давлени",
+        "инсульт",
+        "инфаркт",
+        "опухол",
+        "онколог",
+        "самоуби",
+        "суицид",
+        "покончить с собой",
+        "убить себя",
+        "навредить себе",
+    ]
+    return any(w in t for w in bad_words)
+
+
+# ============================================================
+# ТЕКСТЫ С САЙТА
+# ============================================================
+
+
+def fetch_page_text(url: str, max_len: int = 3500) -> str:
+    """Грубое очищение HTML → плоский текст, только для контекста GPT."""
+    if not url:
+        return ""
+    if url in _page_cache:
+        return _page_cache[url]
+
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        html = resp.text
+        html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+        text = re.sub(r"(?s)<.*?>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()[:max_len]
+        _page_cache[url] = text
+        return text
+    except Exception as e:
+        logging.warning("Не удалось загрузить %s: %s", url, e)
+        return ""
+
+
+def build_extra_context_for_text(text: str) -> str:
+    """Подмешиваем нужные блоки (доставка, возврат, бонусы и т.п.) в зависимости от вопроса."""
+    t = text.lower()
+    parts: List[str] = []
+
+    # Доставка и оплата
+    if any(
+        k in t
+        for k in [
+            "доставк",
+            "курьер",
+            "самовывоз",
+            "kaspi",
+            "оплат",
+            "kaspi red",
+            "kaspi qr",
+        ]
+    ):
+        if DEL:
+            parts.append("=== ДОСТАВКА И ОПЛАТА (файл) ===\n" + DEL)
+        parts.append(
+            "=== ДОСТАВКА И ОПЛАТА (сайт) ===\n"
+            + fetch_page_text(INFO_URLS["delivery"])
+        )
+
+    # Возврат
+    if any(k in t for k in ["возврат", "обмен", "вернуть", "рекламаци"]):
+        if RET:
+            parts.append("=== ВОЗВРАТ (файл) ===\n" + RET)
+        parts.append("=== ВОЗВРАТ (сайт) ===\n" + fetch_page_text(INFO_URLS["return"]))
+
+    # Гарантии
+    if any(k in t for k in ["гаранти", "гарантийный", "брак", "некачествен"]):
+        if WAR:
+            parts.append("=== ГАРАНТИИ (файл) ===\n" + WAR)
+        parts.append(
+            "=== ГАРАНТИИ (сайт) ===\n" + fetch_page_text(INFO_URLS["warranty"])
+        )
+
+    # Бонусы / программа лояльности
+    if any(
+        k in t
+        for k in [
+            "бонус",
+            "bonus",
+            "intertop plus",
+            "интертоп плюс",
+            "карт",
+            "кешбек",
+            "кэшбэк",
+        ]
+    ):
+        if BONUS:
+            parts.append("=== БОНУСЫ (файл) ===\n" + BONUS)
+        parts.append(
+            "=== БОНУСЫ (сайт) ===\n" + fetch_page_text(INFO_URLS["bonus"])
+        )
+
+    # Сертификаты
+    if any(k in t for k in ["сертификат", "подарочн", "gift card", "сертик"]):
+        if CERT:
+            parts.append("=== СЕРТИФИКАТЫ (файл) ===\n" + CERT)
+        parts.append(
+            "=== СЕРТИФИКАТЫ (сайт) ===\n"
+            + fetch_page_text(INFO_URLS["buycert"])
+        )
+
+    # Оферта
+    if any(k in t for k in ["оферт", "договор", "условия покупк", "публичная оферта"]):
+        if OFR:
+            parts.append("=== ОФЕРТА (файл) ===\n" + OFR)
+        parts.append("=== ОФЕРТА (сайт) ===\n" + fetch_page_text(INFO_URLS["offer"]))
+
+    # Вакансии
+    if any(k in t for k in ["ваканси", "работа", "карьер", "hr", "резюме"]):
+        if VAC:
+            parts.append("=== ВАКАНСИИ (файл) ===\n" + VAC)
+        parts.append("=== ВАКАНСИИ (сайт) ===\n" + fetch_page_text(INFO_URLS["work"]))
+
+    # Партнёры / marketplace
+    if any(k in t for k in ["партнер", "партнёр", "marketplace", "маркетплейс"]):
+        if PRT:
+            parts.append("=== ПАРТНЁРЫ (файл) ===\n" + PRT)
+        parts.append(
+            "=== БРЕНДЫ / MARKETPLACE (сайт) ===\n"
+            + fetch_page_text(INFO_URLS["brands"])
+        )
+
+    # О компании
+    if any(k in t for k in ["о компании", "о вас", "что за intertop", "кто вы такие"]):
+        parts.append("=== О НАС (сайт) ===\n" + fetch_page_text(INFO_URLS["about"]))
+
+    return "\n\n".join(p for p in parts if p.strip())
+
+
+# ============================================================
+# ДЕТЕКТ ЯЗЫКА, ПРОФИЛЬ, ТОВАРНЫЕ ЗАПРОСЫ
+# ============================================================
+
+
+def detect_language(text: str) -> str:
+    t = text.lower()
+    if re.search(r"[қөәіңғүұһ]", t):
+        return "kk"
+    if re.search(r"[a-z]", t) and not re.search(r"[а-яё]", t):
+        return "en"
+    return "ru"
+
+
+PRODUCT_KEYWORDS = [
+    "кроссовк",
+    "кеды",
+    "ботинк",
+    "ботильон",
+    "туфл",
+    "лофер",
+    "лоферы",
+    "сапог",
+    "ботфор",
+    "сандал",
+    "сланц",
+    "шлёпк",
+    "шлепк",
+    "слипоны",
+    "куртк",
+    "пуховик",
+    "пальто",
+    "худи",
+    "толстовк",
+    "футболк",
+    "джинс",
+    "брюк",
+    "vans",
+    "timberland",
+    "geox",
+    "skechers",
+    "clarks",
+    "armani",
+    "ea7",
+    "north face",
+    "the north face",
+    "nike",
+    "adidas",
+    "puma",
+]
+
+BUY_TRIGGERS = [
+    "хочу",
+    "нужн",
+    "подбери",
+    "подобрать",
+    "посоветуй",
+    "найди",
+    "ищу",
+    "купить",
+]
+
+
+def is_product_query(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in PRODUCT_KEYWORDS) or any(
+        k in t for k in BUY_TRIGGERS
+    )
+
+
+BRAND_KEYWORDS = {
+    "vans": "Vans",
+    "timberland": "Timberland",
+    "geox": "Geox",
+    "skechers": "Skechers",
+    "clarks": "Clarks",
+    "armani": "Armani",
+    "ea7": "EA7",
+    "north face": "The North Face",
+    "the north face": "The North Face",
+    "nike": "Nike",
+    "adidas": "Adidas",
+    "puma": "Puma",
+}
+
+
+def update_profile_from_text(user_id: str, text: str) -> None:
+    t = text.lower()
+    profile = user_profile.get(user_id, {})
+
+    if "мужск" in t:
+        profile["gender"] = "мужской"
+    elif "женск" in t:
+        profile["gender"] = "женский"
+    elif any(w in t for w in ["детск", "ребён", "ребен", "kid", "kids"]):
+        profile["gender"] = "детский"
+
+    size_match = re.search(r"(\d{2})\s*(?:размер)?", t)
+    if size_match:
+        profile["size"] = size_match.group(1)
+
+    budget_match = re.search(r"до\s+([\d\s]+)", t)
+    if budget_match:
+        profile["budget"] = "до " + budget_match.group(1).strip()
+
+    brands: List[str] = profile.get("brands", [])
+    for key, nice in BRAND_KEYWORDS.items():
+        if key in t and nice not in brands:
+            brands.append(nice)
+    if brands:
+        profile["brands"] = brands
+
+    if profile:
+        user_profile[user_id] = profile
+
+
+# ============================================================
+# GPT-МОЗГ (адаптация твоего ask() под webhook)
+# ============================================================
+
+
+def ask(
+    user_id: str,
+    text: str,
+    mode: str = "faq",
+    extra: str = "",
+) -> str:
+    forced_lang = user_lang.get(user_id)
+    if forced_lang:
+        lang_code = forced_lang
+    else:
+        lang_code = detect_language(text)
+
+    lang_label = {
+        "ru": "Russian",
+        "en": "English",
+        "kk": "Kazakh",
+    }.get(lang_code, "Russian")
+
+    system = (
+        "Ты — умный, тактичный и остроумный бренд-ассистент сети магазинов INTERTOP в Казахстане.\n"
+        "Ты понимаешь русский, казахский и английский язык и можешь свободно переключаться между ними.\n\n"
+        "ТВОЯ ТЕМАТИКА ЖЁСТКО ОГРАНИЧЕНА: только INTERTOP и всё, что связано с покупками и сервисом.\n"
+        "Разрешённые темы: обувь, одежда, аксессуары, бренды, подбор образов, размеры, уход за обувью и одеждой, "
+        "заказы, оплата, доставка, возврат, гарантия, рекламации, бонусы, сертификаты, магазины, вакансии, партнёры Marketplace.\n"
+        "Если вопрос НЕ про INTERTOP и не про покупки (например, мусор, ремонт, путешествия, здоровье, политика, отношения и т.п.) — "
+        "не отвечай по сути, а мягко объясни, что ты можешь помочь только с вопросами по INTERTOP и покупкам.\n\n"
+        f"Предполагаемый язык пользователя: {lang_label}. "
+        "Отвечай в первую очередь на этом языке. Если вопрос смешанный — отвечай на русском.\n\n"
+        "Твой стиль общения:\n"
+        "- дружелюбный, уважительный, без фамильярности;\n"
+        "- понятные, короткие фразы без сложного канцелярита;\n"
+        "- лёгкий юмор и эмодзи уместны, но не перебарщивай (обычно 1–3 смайлика на ответ максимум);\n"
+        "- всегда за клиента, но строго в рамках правил INTERTOP и Законодательства РК.\n\n"
+        "По умолчанию отвечай КОРОТКО: примерно 3–6 предложений или до 6 пунктов списка.\n"
+        "Если клиент явно просит «подробнее», «очень детально», «по шагам» — можешь дать развёрнутый ответ, но без воды.\n\n"
+        "Если информации для точного ответа не хватает (например, нет размера, пола, бюджета, города), "
+        "сначала задай 1–2 коротких уточняющих вопроса, а потом предлагай варианты.\n"
+        "Не придумывай факты, которых нет в переданных документах или общих знаниях.\n\n"
+        "По медицине, здоровью, опасным или незаконным действиям советов не даёшь.\n\n"
+        "Формат ответа — аккуратный Markdown (без HTML-тегов и кодовых блоков):\n"
+        "- структурируй текст списками `-` или нумерацией `1.`;\n"
+        "- при необходимости используй короткие подзаголовки `###` внутри ответа;\n"
+        "- выделяй важное `**жирным**`.\n\n"
+        "Прямые ссылки (URL) в тексте НЕ пиши. Если нужно, просто упомяни, что подробная информация есть "
+        "на официальном сайте INTERTOP или её подскажут в call-центре.\n\n"
+        "Адреса и магазины не выдумывай — опирайся только на тексты, которые тебе передали.\n"
+        "Если в переданных текстах нет точных цифр (сроки, проценты, суммы, условия акций), не придумывай их: "
+        "лучше мягко предложи клиенту уточнить в call-центре, у оператора или в актуальной версии на сайте.\n\n"
+        "В конце ответа, если уместно, предложи логичный следующий шаг (например: спросить про размер, "
+        "посмотреть подбор в приложении, обратиться в call-центр, прийти в магазин) — мягко и без навязчивых продаж.\n"
+    )
+
+    profile = user_profile.get(user_id)
+    if profile:
+        system += "\n=== Профиль клиента (для стилистики и рекомендаций) ===\n"
+        if "gender" in profile:
+            system += f"Пол: {profile['gender']}\n"
+        if "size" in profile:
+            system += f"Размер обуви: {profile['size']}\n"
+        if "budget" in profile:
+            system += f"Бюджет: {profile['budget']}\n"
+        if profile.get("brands"):
+            system += "Любимые бренды: " + ", ".join(profile["brands"]) + "\n"
+
+    if mode == "style":
+        system += (
+            "\nСейчас у тебя режим <стилиста>.\n"
+            "Фокус — практичные и честные рекомендации, которые помогают клиенту определиться с покупкой.\n"
+        )
+    elif mode == "lawyer":
+        system += (
+            "\nСейчас у тебя режим поддержки по сложной ситуации/жалобе.\n"
+            "Говори спокойно, профессионально и эмпатично, без лишнего юридического жаргона.\n"
+        )
+
+    if extra:
+        system += (
+            "\n\n=== Внутренняя база INTERTOP (файлы, регламенты, сайт) ===\n"
+            + extra
+        )
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
+    history = dialog_history.get(user_id, [])
+    if history:
+        messages.extend(history[-10:])
+
+    messages.append({"role": "user", "content": text})
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            max_tokens=350,
+            temperature=0.25 if mode != "style" else 0.5,
+        )
+        answer_md = (resp.choices[0].message.content or "").strip()
+
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": answer_md})
+        dialog_history[user_id] = history[-12:]
+
+        # В SendPulse можно отправлять Markdown как есть
+        return answer_md
+    except Exception:
+        logging.exception("Ошибка при запросе к OpenAI")
+        return (
+            "Немного перегрелся от модных вопросов 😅\n"
+            "Попробуйте ещё раз чуть позже или свяжитесь с call-центром:\n"
+            "📞 +7 705 924 11 00."
+        )
+
+
+# ============================================================
+# ОБРАБОТКА ЗАПРОСА ОТ SENDPULSE
+# ============================================================
+
+LAW_KEYWORDS = [
+    "брак",
+    "вернуть",
+    "претенз",
+    "рекламаци",
+    "нарушен",
+    "жалоб",
+]
+
+STYLE_KEYWORDS = [
+    "с чем носить",
+    "как носить",
+    "с чем лучше",
+    "образ",
+    "лук",
+    "под что носить",
+    "под что подходит",
+    "подбери образ",
+    "как сочетать",
+]
+
+
+def generate_reply(user_id: str, text: str) -> str:
+    t = text.lower()
+    current_mode = state.get(user_id, "faq")
+
+    # Жёсткий оффтоп (здоровье и т.п.)
+    if is_hard_offtopic(t):
+        return (
+            "По вопросам здоровья и серьёзных состояний я подсказать не могу 🙏\n"
+            "Лучше обратиться к врачу или в профильную службу.\n\n"
+            "Но если нужен совет по обуви, одежде или INTERTOP — я здесь 😊"
+        )
+
+    # Определяем спец-режим
+    if any(w in t for w in LAW_KEYWORDS):
+        current_mode = "lawyer"
+        state[user_id] = "lawyer"
+    elif any(w in t for w in STYLE_KEYWORDS):
+        current_mode = "style"
+        state[user_id] = "style"
+
+    # Обновляем профиль
+    if current_mode == "style" or is_product_query(text):
+        update_profile_from_text(user_id, text)
+
+    extra = build_extra_context_for_text(text)
+    if current_mode == "lawyer" and LAW:
+        extra = (extra + "\n\n=== Шаблоны ответов адвоката ===\n" + LAW).strip()
+
+    return ask(user_id, text, mode=current_mode, extra=extra)
+
+
+# ============================================================
+# FASTAPI ПРИЛОЖЕНИЕ
+# ============================================================
 
 
 class AIRequest(BaseModel):
     message: str
-    contact_id: Optional[str] = None  # SendPulse contact_id (useful as safety_identifier)
+    contact_id: Optional[str] = None
     user_id: Optional[str] = None
 
 
 app = FastAPI()
-
-
-def _extract_output_text(resp_json: Dict[str, Any]) -> str:
-    parts: List[str] = []
-    for item in resp_json.get("output", []) or []:
-        if item.get("type") != "message":
-            continue
-        for c in item.get("content", []) or []:
-            if c.get("type") == "output_text" and c.get("text"):
-                parts.append(c["text"])
-    return "".join(parts).strip()
-
-
-def call_openai(message: str, safety_identifier: Optional[str]) -> str:
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload: Dict[str, Any] = {
-        "model": OPENAI_MODEL,
-        "input": message,
-        "instructions": SYSTEM_PROMPT,
-        "temperature": 0.25,
-        "max_output_tokens": 350,
-        "store": False,
-    }
-    if safety_identifier:
-        payload["safety_identifier"] = safety_identifier
-
-    r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=55)
-    r.raise_for_status()
-    data = r.json()
-    text = _extract_output_text(data)
-    return text or "Извините, не удалось сформировать ответ. Попробуйте ещё раз."
 
 
 @app.get("/health")
@@ -73,6 +543,7 @@ def health():
 
 @app.post("/ai")
 def ai(req: AIRequest, x_ai_secret: Optional[str] = Header(default=None)):
+    # Простейшая авторизация по заголовку
     if AI_WEBHOOK_SECRET and x_ai_secret != AI_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
 
@@ -80,10 +551,10 @@ def ai(req: AIRequest, x_ai_secret: Optional[str] = Header(default=None)):
     if not msg:
         raise HTTPException(status_code=400, detail="message is required")
 
-    safety_id = req.contact_id or req.user_id
-    reply = call_openai(msg, safety_identifier=str(safety_id) if safety_id else None)
+    user_key = str(req.contact_id or req.user_id or "anon")
+    reply = generate_reply(user_key, msg)
 
-    # Keep replies safely under SendPulse limits (and Telegram)
+    # На всякий случай ограничим длину
     if len(reply) > 3500:
         reply = reply[:3500] + "…"
 
