@@ -1,6 +1,9 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-requests>=2.31
-pydantic>=2.6
-openai>=1.3.0
+services:
+  - type: web
+    name: intertop-sendpulse-ai
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
 
